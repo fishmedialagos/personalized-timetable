@@ -41,6 +41,24 @@ except Exception:
 
 ALL_CODES = sorted(timetable_df["Course Code Clean"].unique().tolist())
 
+# Faculty → Batch mapping (official NOUN split)
+BATCH_A_FACULTIES = [
+    "Faculty of Arts",
+    "Faculty of Computing",
+    "Faculty of Education",
+    "Faculty of Management Sciences",
+]
+
+BATCH_B_FACULTIES = [
+    "Faculty of Agricultural Sciences",
+    "Faculty of Law",
+    "Faculty of Sciences",
+    "Faculty of Health Sciences",
+    "Faculty of Social Sciences",
+]
+
+ALL_FACULTIES = BATCH_A_FACULTIES + BATCH_B_FACULTIES
+
 # ----------------------- PDF Generator -----------------------
 class ColoredLine(Flowable):
     def __init__(self, width, thickness=1.5, color=colors.HexColor("#1e3a5f")):
@@ -118,6 +136,8 @@ def generate_pdf(student_info: dict, exams: list) -> bytes:
         [Paragraph("Semester / Session", label_style),
          Paragraph(f"{student_info['semester']}  ·  {student_info['session']}", value_style),
          Paragraph("Study Centre", label_style), Paragraph(student_info["centre"], value_style)],
+        [Paragraph("Faculty", label_style), Paragraph(student_info.get("faculty", ""), value_style),
+         Paragraph("Batch", label_style), Paragraph(student_info.get("batch", ""), value_style)],
     ]
     info_table = Table(info_data, colWidths=[38*mm, 50*mm, 42*mm, 42*mm])
     info_table.setStyle(TableStyle([
@@ -192,7 +212,7 @@ def generate_pdf(student_info: dict, exams: list) -> bytes:
     story.append(Spacer(1, 2 * mm))
     story.append(Paragraph("ACADEMIC SUPPORT SERVICES", support_title))
     story.append(Paragraph("WE WISH YOU THE BEST OF LUCK", support_wish))
-    story.append(Paragraph("<b>MR FISH</b><br/>ACADEMIC SUPPORT PARTNER<br/>YOUR SUCCESS OUR PRIRITY", support_body))
+    story.append(Paragraph("<b>MR FISH</b><br/>ACADEMIC SUPPORT PARTNER<br/>YOUR SUCCESS OUR PRIORITY", support_body))
     story.append(Paragraph("CALL / WHATSAPP: 08109213232", support_contact))
     story.append(Paragraph("Visit our office beside NOUN V.I Study Centre, Nigeria Air Force Base Camp.", support_addr))
     story.append(Spacer(1, 2.5 * mm))
@@ -208,6 +228,37 @@ def generate_pdf(student_info: dict, exams: list) -> bytes:
     doc.build(story)
     buffer.seek(0)
     return buffer.getvalue()
+
+
+# ----------------------- Matching Helper -----------------------
+def resolve_course(code: str, preferred_batch: str, df: pd.DataFrame):
+    """
+    Resolve a course code to the correct row(s), respecting Batch A / Batch B
+    for general courses (GST, NOU, NOUN-GST, etc.).
+    """
+    code = code.upper().strip()
+
+    # Exact match first
+    hits = df[df["Course Code Clean"] == code]
+    if not hits.empty:
+        return hits
+
+    # If user typed base code (e.g. GST201), look for Batch variants
+    batch_suffix = f"-{preferred_batch}"
+    preferred = df[df["Course Code Clean"] == f"{code}{batch_suffix}"]
+    if not preferred.empty:
+        return preferred
+
+    # Fallback: any code that starts with the given code
+    hits = df[df["Course Code Clean"].str.startswith(code)]
+    if not hits.empty:
+        # Prefer the correct batch if both exist
+        batch_hits = hits[hits["Course Code Clean"].str.endswith(batch_suffix)]
+        if not batch_hits.empty:
+            return batch_hits
+        return hits
+
+    return pd.DataFrame()  # empty
 
 
 # ----------------------- UI -----------------------
@@ -234,6 +285,20 @@ with st.form("student_form"):
         centre = st.text_input("Study Centre *", placeholder="e.g. Lagos Study Centre")
         semester = st.selectbox("Semester", ["First Semester", "Second Semester"], index=0)
 
+    faculty = st.selectbox(
+        "Faculty *",
+        options=ALL_FACULTIES,
+        help="This determines whether general courses (GST, NOU, etc.) use Batch A or Batch B"
+    )
+
+    # Show which batch will be used
+    if faculty in BATCH_A_FACULTIES:
+        preferred_batch = "A"
+        st.info("**Batch A** will be used for general courses (GST / NOU)")
+    else:
+        preferred_batch = "B"
+        st.info("**Batch B** will be used for general courses (GST / NOU)")
+
     st.subheader("Registered Courses")
     st.caption("Select all course codes the student registered for this exam (you can type to search)")
     selected_codes = st.multiselect(
@@ -246,13 +311,13 @@ with st.form("student_form"):
     manual_codes = st.text_input(
         "Or type course codes manually (comma separated)",
         placeholder="e.g. EDU231, ENG221, GST201",
-        help="Useful if a code is missing from the list",
+        help="Useful if a code is missing from the list. You can type GST201 (without -A/-B) — the correct batch will be chosen automatically.",
     )
 
     submitted = st.form_submit_button("Generate Personalized Timetable", type="primary", use_container_width=True)
 
 if submitted:
-    if not name or not matric or not programme or not centre:
+    if not name or not matric or not programme or not centre or not faculty:
         st.error("Please fill in all required student details (marked with *).")
     else:
         # Combine selected + manual
@@ -265,22 +330,14 @@ if submitted:
         if not codes:
             st.error("Please select or type at least one course code.")
         else:
-            # Lookup exams
+            # Lookup exams using the correct batch
             matched = []
             not_found = []
             for code in codes:
-                # Prefer exact match, then partial (for GST201 vs GST201-A)
-                hits = timetable_df[timetable_df["Course Code Clean"] == code]
-                if hits.empty:
-                    hits = timetable_df[timetable_df["Course Code Clean"].str.startswith(code)]
+                hits = resolve_course(code, preferred_batch, timetable_df)
                 if hits.empty:
                     not_found.append(code)
                 else:
-                    # Prefer Batch A if available for GST courses
-                    if code.startswith("GST") and len(hits) > 1:
-                        batch_a = hits[hits["Course Code"].str.contains("-A", na=False)]
-                        if not batch_a.empty:
-                            hits = batch_a
                     for _, row in hits.iterrows():
                         matched.append({
                             "Date": row["Date"],
@@ -303,11 +360,13 @@ if submitted:
                     "centre": centre.strip(),
                     "semester": semester,
                     "session": "2026_2",
+                    "faculty": faculty,
+                    "batch": f"Batch {preferred_batch}",
                 }
 
                 pdf_bytes = generate_pdf(student_info, matched)
 
-                st.success(f"Found {len(matched)} exam slot(s) for {len(codes)} course code(s).")
+                st.success(f"Found {len(matched)} exam slot(s) for {len(codes)} course code(s) using **Batch {preferred_batch}**.")
                 if not_found:
                     st.warning(f"These codes were not found: {', '.join(not_found)}")
 
